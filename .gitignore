@@ -1,0 +1,29 @@
+# Ignore Python virtual environments
+venv_rt310
+env/
+ENV/
+
+# Ignore build and distribution folders
+build/
+dist/
+*.egg-info/
+
+# Ignore IDE/editor folders
+.vscode/
+.idea/
+
+# Ignore OS-specific folders
+.DS_Store/
+Thumbs.db/
+
+# Ignore logs and temporary files
+logs/
+tmp/
+.cache/
+__pycache__/
+__pycache__/constants.cpython-310.pyc
+
+# add frame_Actions folder
+frame_Actions/
+models/
+data/
