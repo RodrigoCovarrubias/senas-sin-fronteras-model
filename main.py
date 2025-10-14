@@ -12,7 +12,6 @@ from evaluate_model import normalize_keypoints
 from helpers import *
 from constants import *
 from text_to_speech import text_to_speech
-from normalize_samples import *
 
 
 class VideoRecorder(QMainWindow):
