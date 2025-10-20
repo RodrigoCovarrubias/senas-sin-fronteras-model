@@ -19,7 +19,7 @@ def upload_video():
     video_file.save(tmp_file)
     
     video_processed = process_video(tmp_file)
-    resp = evaluate_model(video_processed)
+    resp = evaluate_model(video_processed) 
     resp = [r.upper() for r in resp][::-1]
     
     return " - ".join(resp)

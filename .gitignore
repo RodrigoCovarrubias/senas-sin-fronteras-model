@@ -27,3 +27,10 @@ __pycache__/constants.cpython-310.pyc
 frame_Actions/
 models/
 data/
+
+.venv_rt310
+.venv3119
+.data
+.debug_runs
+.eval_artifacts
+.all_averges.json   
