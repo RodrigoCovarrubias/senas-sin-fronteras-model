@@ -72,6 +72,7 @@ def evaluate_model(src=None, threshold=0.7, margin_frame=2, delay_frames=2):
                         continue
                     kp_seq = kp_seq[: - (margin_frame + delay_frames)]
                     kp_normalized = normalize_keypoints(kp_seq, int(MODEL_FRAMES))
+                    print("Keypoints enviados:", kp_normalized) 
                     res = model.predict(np.expand_dims(kp_normalized, axis=0))[0]
                     
                     print(np.argmax(res), f"({res[np.argmax(res)] * 100:.2f}%)")
@@ -79,7 +80,7 @@ def evaluate_model(src=None, threshold=0.7, margin_frame=2, delay_frames=2):
                         word_id = word_ids[np.argmax(res)].split('-')[0]
                         sent = words_text.get(word_id)
                         sentence.insert(0, sent)
-                        #text_to_speech(sent) # ONLY LOCAL (NO SERVER)
+                        text_to_speech(sent) # ONLY LOCAL (NO SERVER)
                 
                 recording = False
                 fix_frames = 0
