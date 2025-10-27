@@ -1,395 +1,427 @@
-#!/usr/bin/env python3
 """
-Servidor WebSocket en Python para el sistema de traducción de lengua de señas
-Conecta el frontend (pacientes y doctores) con la API Flask de predicción
+WS prototipo 'todo en el servidor':
+- Carga modelo Keras
+- Recibe 'phrase_frames' (lista de palabras -> lista de frames JPEG base64)
+- Extrae keypoints con MediaPipe Holistic
+- Normaliza a MODEL_FRAMES
+- Predice palabra por palabra
+- Notifica a doctores 'phrase_result' y 'word_result'
 """
 
 import asyncio
-import websockets
 import json
 import logging
-import requests
-from typing import Dict, Set, Optional
-from dataclasses import dataclass, asdict
-from datetime import datetime
 import time
+import base64
+import re
+import io
+from dataclasses import dataclass
+from typing import Dict, Optional, List
 
-# Configuración
+import numpy as np
+import cv2
+import websockets
+from websockets.exceptions import ConnectionClosed
+
+# ====== ML / Keypoints ======
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+import mediapipe as mp
+
+# ===================== Config =====================
+WS_HOST = "0.0.0.0"
 WS_PORT = 8080
-PREDICTION_API_URL = 'http://localhost:8000'
-CHECK_API_INTERVAL = 30  # segundos
 
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+MODEL_PATH = "./model.h5"           # <<--- AJUSTA
+WORDS_JSON_PATH = "./words.json"    # <<--- AJUSTA si usas un mapeo id->texto
+MODEL_FRAMES = 15                   # nº de frames por secuencia que espera el modelo
+THRESHOLD = 0.7                     # umbral prob. para aceptar palabra
 
+# WebSocket settings
+WS_MAX_MSG_SIZE = 4 * 1024 * 1024   # 4MB por mensaje
+WS_PING_INTERVAL = 20
+WS_PING_TIMEOUT  = 20
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+logger = logging.getLogger("ssf-ws")
+
+# ===================== Utilidades =====================
+data_url_re = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<b64>.+)$")
+
+def decode_data_url_to_bgr(data_url: str) -> Optional[np.ndarray]:
+    """
+    data:image/jpeg;base64,/9j/... -> np.ndarray BGR (OpenCV)
+    """
+    m = data_url_re.match(data_url)
+    if not m:
+        return None
+    b = base64.b64decode(m.group("b64"))
+    img_array = np.frombuffer(b, dtype=np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    return img  # BGR
+
+def zero_pad_or_trim(sequence: np.ndarray, target_len: int) -> np.ndarray:
+    """
+    Ajusta la secuencia a target_len en el primer eje.
+    Si es más larga, recorta centrado; si es más corta, zero-pad al final.
+    """
+    n = sequence.shape[0]
+    if n == target_len:
+        return sequence
+    if n > target_len:
+        # recorte centrado
+        start = (n - target_len) // 2
+        return sequence[start:start+target_len]
+    # pad al final
+    pad_shape = (target_len - n,) + sequence.shape[1:]
+    pad = np.zeros(pad_shape, dtype=sequence.dtype)
+    return np.concatenate([sequence, pad], axis=0)
+
+def load_words_map(words_json_path: str) -> List[str]:
+    """
+    Si tienes un JSON con el orden de clases del modelo, cárgalo.
+    Por simplicidad, aquí devolvemos una lista dummy si no existe.
+    Formato esperado: array de etiquetas en el mismo orden que las salidas del modelo.
+    """
+    try:
+        import json as _json
+        with open(words_json_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        # soporta dict {class_id: label} o lista directa
+        if isinstance(data, dict):
+            # ordénalo por clave numérica si corresponde
+            keys = sorted(data.keys(), key=lambda k: int(str(k).split("-")[0]) if str(k).split("-")[0].isdigit() else str(k))
+            return [data[k] for k in keys]
+        if isinstance(data, list):
+            return data
+    except Exception as e:
+        logger.warning(f"No se pudo leer {words_json_path}: {e}")
+    # fallback
+    return [f"label_{i}" for i in range(100)]
+
+# ===================== Keypoints con MediaPipe =====================
+mp_holistic = mp.solutions.holistic
+
+def extract_keypoints(results: mp_holistic.Holistic) -> np.ndarray:
+    """
+    Mismo layout clásico:
+      pose: 33*4 (x,y,z,visibility)
+      face: 468*3 (x,y,z)
+      manos: 21*3 por mano (izq/der)
+    """
+    pose = []
+    if results.pose_landmarks:
+        for lm in results.pose_landmarks.landmark:
+            pose.extend([lm.x, lm.y, lm.z, lm.visibility])
+    else:
+        pose = [0.0] * (33 * 4)
+
+    face = []
+    if results.face_landmarks:
+        for lm in results.face_landmarks.landmark:
+            face.extend([lm.x, lm.y, lm.z])
+    else:
+        face = [0.0] * (468 * 3)
+
+    lh = []
+    if results.left_hand_landmarks:
+        for lm in results.left_hand_landmarks.landmark:
+            lh.extend([lm.x, lm.y, lm.z])
+    else:
+        lh = [0.0] * (21 * 3)
+
+    rh = []
+    if results.right_hand_landmarks:
+        for lm in results.right_hand_landmarks.landmark:
+            rh.extend([lm.x, lm.y, lm.z])
+    else:
+        rh = [0.0] * (21 * 3)
+
+    return np.array(pose + face + lh + rh, dtype=np.float32)
+
+def frames_to_keypoints_sequence(frames_bgr: List[np.ndarray], holistic: mp_holistic.Holistic) -> np.ndarray:
+    """
+    Convierte lista de frames BGR -> [T, D] keypoints.
+    """
+    seq = []
+    for bgr in frames_bgr:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        res = holistic.process(rgb)
+        kps = extract_keypoints(res)
+        seq.append(kps)
+    return np.stack(seq, axis=0)  # [T, D]
+
+# ===================== WebSocket Server =====================
 @dataclass
 class ClientInfo:
-    """Información de un cliente conectado"""
     ws: websockets.WebSocketServerProtocol
-    session_id: str
+    session_id: Optional[str]
     client_id: str
-    client_type: str  # 'doctor' or 'patient'
-
-@dataclass
-class PredictionRequest:
-    """Estructura para peticiones de predicción"""
-    sequences: list
-    threshold: float = 0.7
+    client_type: str  # 'doctor' | 'patient'
 
 class WebSocketServer:
     def __init__(self):
         self.doctors: Dict[str, ClientInfo] = {}
         self.patients: Dict[str, ClientInfo] = {}
-        self.sessions: Dict[str, Dict] = {}
-        self.api_connected = False
-        
-    async def start_server(self):
-        """Inicia el servidor WebSocket"""
-        logger.info(f"🚀 Iniciando servidor WebSocket en puerto {WS_PORT}")
-        logger.info(f"📡 API de predicción configurada en: {PREDICTION_API_URL}")
-        
-        # Iniciar verificación periódica de la API
-        asyncio.create_task(self.periodic_api_check())
-        
-        # Iniciar servidor WebSocket
-        async with websockets.serve(self.handle_client, "localhost", WS_PORT):
-            logger.info("✅ Servidor WebSocket iniciado correctamente")
-            await asyncio.Future()  # Mantener servidor activo
-    
-    async def handle_client(self, websocket):
-        """Maneja una nueva conexión de cliente"""
-        client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
-        logger.info(f"🔗 Nueva conexión WebSocket desde {client_ip}")
-        
+        self.sessions: Dict[str, Dict[str, Optional[str]]] = {}
+
+        # ML
+        logger.info("Cargando modelo Keras...")
+        self.model = load_model(MODEL_PATH)
+        logger.info("Modelo cargado.")
+        self.class_labels = load_words_map(WORDS_JSON_PATH)
+        logger.info(f"Clases cargadas: {len(self.class_labels)}")
+
+        # MediaPipe Holistic: crear uno por servidor (uso en to_thread)
+        self.holistic = mp_holistic.Holistic(static_image_mode=False, model_complexity=1)
+
+    async def start(self):
+        logger.info(f"🚀 WS en {WS_HOST}:{WS_PORT}")
+        async with websockets.serve(
+            self._handle_client,
+            WS_HOST,
+            WS_PORT,
+            max_size=WS_MAX_MSG_SIZE,
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
+        ):
+            logger.info("✅ Servidor WebSocket listo (modelo en memoria)")
+            await asyncio.Future()
+
+    async def _handle_client(self, websocket):
+        peer = getattr(websocket, "remote_address", ("?", "?"))[0]
+        logger.info(f"🔗 Conexión desde {peer}")
         try:
-            async for message in websocket:
-                await self.process_message(websocket, message)
-        except websockets.exceptions.ConnectionClosed:
+            async for raw in websocket:
+                try:
+                    data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                except Exception:
+                    await self._send_error(websocket, "JSON inválido")
+                    continue
+
+                msg_type = data.get("type")
+                if msg_type == "register":
+                    await self._handle_register(websocket, data)
+                elif msg_type == "phrase_frames":
+                    await self._handle_phrase_frames(websocket, data)
+                elif msg_type == "word_frames":
+                    # Soporte opcional por compatibilidad
+                    await self._handle_word_frames(websocket, data)
+                else:
+                    await self._send_error(websocket, f"Tipo de mensaje desconocido: {msg_type}")
+        except ConnectionClosed:
             logger.info("🔌 Cliente desconectado")
         except Exception as e:
-            logger.error(f"❌ Error manejando cliente: {e}")
+            logger.exception(f"Error cliente: {e}")
         finally:
-            await self.cleanup_client(websocket)
-    
-    async def process_message(self, websocket, message):
-        """Procesa un mensaje recibido del cliente"""
-        try:
-            data = json.loads(message)
-            message_type = data.get('type')
-            
-            logger.info(f"📨 Mensaje recibido: {message_type}")
-            
-            if message_type == 'register':
-                await self.handle_register(websocket, data)
-            elif message_type == 'frame_data':
-                await self.handle_frame_data(websocket, data)
-            elif message_type == 'manual_translation':
-                await self.handle_manual_translation(websocket, data)
-            else:
-                logger.warning(f"❓ Tipo de mensaje desconocido: {message_type}")
-                await self.send_error(websocket, f"Tipo de mensaje desconocido: {message_type}")
-                
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ Error decodificando JSON: {e}")
-            await self.send_error(websocket, "Error decodificando mensaje JSON")
-        except Exception as e:
-            logger.error(f"❌ Error procesando mensaje: {e}")
-            await self.send_error(websocket, "Error procesando mensaje")
-    
-    async def handle_register(self, websocket, data):
-        """Maneja el registro de un nuevo cliente"""
-        try:
-            client_id = data.get('id')
-            client_type = data.get('clientType')
-            session_id = data.get('sessionId')
-            
-            if not client_id or not client_type:
-                await self.send_error(websocket, "ID y clientType son requeridos")
-                return
-            
-            client_info = ClientInfo(
-                ws=websocket,
-                session_id=session_id,
-                client_id=client_id,
-                client_type=client_type
-            )
-            
-            # Registrar cliente según tipo
-            if client_type == 'doctor':
-                self.doctors[client_id] = client_info
-                logger.info(f"👩‍⚕️ Doctor registrado: {client_id} en sesión {session_id}")
-                
-                # Enviar confirmación
-                await websocket.send(json.dumps({
-                    'type': 'registered',
-                    'clientType': 'doctor',
-                    'id': client_id,
-                    'sessionId': session_id
-                }))
-                
-                # Enviar estado actual de la API
-                await websocket.send(json.dumps({
-                    'type': 'api_status',
-                    'connected': self.api_connected,
-                    'timestamp': int(time.time() * 1000)
-                }))
-                
-            elif client_type == 'patient':
-                self.patients[client_id] = client_info
-                logger.info(f"🏥 Paciente registrado: {client_id} en sesión {session_id}")
-                
-                # Enviar confirmación
-                await websocket.send(json.dumps({
-                    'type': 'registered',
-                    'clientType': 'patient',
-                    'id': client_id,
-                    'sessionId': session_id
-                }))
-            
-            # Actualizar sesiones
-            if session_id:
-                if session_id not in self.sessions:
-                    self.sessions[session_id] = {'patient': None, 'doctor': None}
-                self.sessions[session_id][client_type] = client_id
-                
-        except Exception as e:
-            logger.error(f"❌ Error registrando cliente: {e}")
-            await self.send_error(websocket, f"Error registrando cliente: {str(e)}")
-    
-    async def handle_frame_data(self, websocket, data):
-        """Maneja datos de keypoints del paciente"""
-        try:
-            patient_id = data.get('patientId')
-            session_id = data.get('sessionId')
-            sequence = data.get('sequence', [])
-            
-            logger.info(f"📥 Keypoints recibidos del paciente {patient_id}: {len(sequence)} frames")
-            
-            if not sequence:
-                logger.warning("⚠️ Secuencia vacía recibida")
-                return
-            
-            # Enviar a API de predicción
-            try:
-                prediction = await self.get_prediction(sequence)
-                
-                if prediction and prediction.strip():
-                    logger.info(f"🎯 Predicción obtenida: '{prediction}'")
-                    
-                    # Enviar predicción a todos los doctores de la sesión
-                    await self.send_prediction_to_doctors(session_id, patient_id, prediction)
-                else:
-                    logger.info("⚪ Sin predicción válida para esta secuencia")
-                    
-            except Exception as prediction_error:
-                logger.error(f"❌ Error procesando predicción: {prediction_error}")
-                
-                # Enviar error a doctores
-                await self.send_prediction_error_to_doctors(session_id, str(prediction_error))
-                
-        except Exception as e:
-            logger.error(f"❌ Error manejando frame_data: {e}")
-    
-    async def handle_manual_translation(self, websocket, data):
-        """Maneja traducción manual enviada por el doctor"""
-        try:
-            session_id = data.get('sessionId')
-            text = data.get('text', '')
-            
-            logger.info(f"📝 Traducción manual: {text}")
-            
-            # Reenviar a doctores de la sesión
-            for doctor_id, doctor_info in self.doctors.items():
-                if doctor_info.session_id == session_id:
-                    await doctor_info.ws.send(json.dumps(data))
-                    
-        except Exception as e:
-            logger.error(f"❌ Error manejando traducción manual: {e}")
-    
-    async def get_prediction(self, sequence):
-        """Obtiene predicción de la API Flask"""
-        try:
-            # Preparar datos para la API
-            request_data = {
-                'sequences': [sequence],  # API espera array de secuencias
-                'threshold': 0.7
-            }
-            
-            logger.info(f"🔮 Enviando {len(sequence)} frames a API de predicción...")
-            
-            # Realizar petición HTTP síncrona (requests en hilo separado)
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None, 
-                lambda: requests.post(
-                    f"{PREDICTION_API_URL}/predict-batch",
-                    json=request_data,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=10
-                )
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                # La API devuelve una lista directamente
-                if isinstance(result, list) and len(result) > 0:
-                    prediction = result[0]
-                    logger.info(f"✅ Predicción recibida: '{prediction}'")
-                    return prediction
-                else:
-                    logger.info("⚪ API no retornó predicciones")
-                    return None
-            elif response.status_code == 422:
-                try:
-                    error_detail = response.json().get('detail', 'Error de validación')
-                except Exception:
-                    error_detail = response.text
-                logger.error(f"🔴 Error 422 en API: {error_detail}")
-                return None
-            else:
-                logger.error(f"🔴 Error HTTP {response.status_code}: {response.text}")
-                return None
-                
-        except requests.exceptions.Timeout:
-            logger.error("⏰ Timeout conectando con API de predicción")
-            return None
-        except requests.exceptions.ConnectionError:
-            logger.error("🔌 Error de conexión con API de predicción")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Error inesperado en predicción: {e}")
-            return None
-    
-    async def send_prediction_to_doctors(self, session_id, patient_id, prediction):
-        """Envía predicción a todos los doctores de una sesión"""
-        message = {
-            'type': 'prediction_result',
-            'sessionId': session_id,
-            'patientId': patient_id,
-            'prediction': prediction,
-            'timestamp': int(time.time() * 1000),
-            'confidence': 'high'
+            await self._cleanup_client(websocket)
+
+    async def _handle_register(self, websocket, data):
+        cid = data.get("id")
+        ctype = data.get("clientType")
+        sid = data.get("sessionId")
+        if not cid or ctype not in ("doctor", "patient"):
+            await self._send_error(websocket, "Campos requeridos: id, clientType ('doctor'|'patient')")
+            return
+
+        info = ClientInfo(ws=websocket, session_id=sid, client_id=cid, client_type=ctype)
+        if ctype == "doctor":
+            self.doctors[cid] = info
+        else:
+            self.patients[cid] = info
+
+        if sid:
+            self.sessions.setdefault(sid, {"patient": None, "doctor": None})
+            self.sessions[sid][ctype] = cid
+
+        await websocket.send(json.dumps({
+            "type": "registered",
+            "clientType": ctype,
+            "id": cid,
+            "sessionId": sid
+        }))
+
+    # ---------- Phrase (lista de lista) ----------
+    async def _handle_phrase_frames(self, websocket, data):
+        """
+        data: {
+          type: "phrase_frames",
+          sessionId, patientId, phraseId,
+          words: [ [ {ts,mime,data}, ... ], [ ... ], ... ],
+          meta: {width,height,fps}?,
+          wordTexts?: [],
+          phraseText?: ""
         }
-        
-        doctors_notified = 0
-        for doctor_id, doctor_info in self.doctors.items():
-            if doctor_info.session_id == session_id:
+        """
+        session_id = data.get("sessionId")
+        patient_id = data.get("patientId")
+        phrase_id  = data.get("phraseId")
+        words      = data.get("words", [])
+        if not session_id or not isinstance(words, list) or len(words) == 0:
+            await self._send_error(websocket, "phrase_frames: payload inválido")
+            return
+
+        # límites defensivos
+        MAX_WORDS = 20
+        MAX_FRAMES_PER_WORD = 120
+        words = words[:MAX_WORDS]
+
+        # Procesar en hilo para no bloquear el loop
+        word_preds = await asyncio.to_thread(self._predict_phrase, words, MAX_FRAMES_PER_WORD)
+
+        # Construir resultados
+        word_results = []
+        final_texts = []
+        for pred_label, prob in word_preds:
+            if pred_label is None:
+                word_results.append({"label": None, "prob": 0.0})
+                continue
+            word_results.append({"label": pred_label, "prob": float(prob)})
+            # aplicar threshold aquí si quieres filtrar palabras con baja confianza
+            if prob >= THRESHOLD:
+                final_texts.append(pred_label)
+
+        phrase_text = " ".join(final_texts).strip()
+
+        # Notificar doctores de la sesión
+        msg = {
+            "type": "phrase_result",
+            "sessionId": session_id,
+            "patientId": patient_id,
+            "phraseId": phrase_id,
+            "words": word_results,             # [{label, prob}, ...] en el mismo orden que 'words'
+            "phraseText": phrase_text,         # texto reconstruido por umbral
+            "timestamp": int(time.time()*1000),
+            "threshold": THRESHOLD
+        }
+        await self._broadcast_to_doctors(session_id, msg)
+
+    def _predict_phrase(self, words_payload: List[List[dict]], max_frames_per_word: int):
+        """
+        Sin async: corre en hilo via asyncio.to_thread
+        - Decodifica frames
+        - Extrae keypoints
+        - Normaliza a MODEL_FRAMES
+        - Predice
+        Devuelve lista de tuplas (label, prob) por palabra en el mismo orden.
+        """
+        results = []
+        for w_idx, word_frames in enumerate(words_payload):
+            if not isinstance(word_frames, list) or not word_frames:
+                results.append((None, 0.0))
+                continue
+
+            # 1) Decode data URLs -> BGR
+            frames_bgr = []
+            for i, fr in enumerate(word_frames[:max_frames_per_word]):
+                data_url = fr.get("data")
+                if not data_url:
+                    continue
+                img = decode_data_url_to_bgr(data_url)
+                if img is None:
+                    continue
+                frames_bgr.append(img)
+            if not frames_bgr:
+                results.append((None, 0.0))
+                continue
+
+            # 2) Keypoints para cada frame
+            seq = frames_to_keypoints_sequence(frames_bgr, self.holistic)  # [T, D]
+
+            # 3) Normalizar a MODEL_FRAMES
+            seq_fixed = zero_pad_or_trim(seq, MODEL_FRAMES)                # [MODEL_FRAMES, D]
+
+            # 4) Predicción
+            inp = np.expand_dims(seq_fixed, axis=0)                        # [1, T, D]
+            probs = self.model.predict(inp, verbose=0)[0]                  # [num_classes]
+            cls_idx = int(np.argmax(probs))
+            prob = float(probs[cls_idx])
+
+            # 5) Label legible
+            label = self.class_labels[cls_idx] if cls_idx < len(self.class_labels) else f"class_{cls_idx}"
+            results.append((label, prob))
+        return results
+
+    # ---------- Word (compat) ----------
+    async def _handle_word_frames(self, websocket, data):
+        """
+        Igual a 'phrase' pero para una sola palabra.
+        """
+        session_id = data.get("sessionId")
+        patient_id = data.get("patientId")
+        word_id    = data.get("wordId")
+        frames     = data.get("frames", [])
+        if not session_id or not isinstance(frames, list) or len(frames) == 0:
+            await self._send_error(websocket, "word_frames: payload inválido")
+            return
+
+        preds = await asyncio.to_thread(self._predict_phrase, [frames], 120)
+        label, prob = preds[0] if preds else (None, 0.0)
+        msg = {
+            "type": "word_result",
+            "sessionId": session_id,
+            "patientId": patient_id,
+            "wordId": word_id,
+            "label": label,
+            "prob": float(prob),
+            "accepted": bool(label and prob >= THRESHOLD),
+            "timestamp": int(time.time()*1000),
+            "threshold": THRESHOLD
+        }
+        await self._broadcast_to_doctors(session_id, msg)
+
+    # ---------- Utils ----------
+    async def _broadcast_to_doctors(self, session_id: str, payload: dict):
+        sent = 0
+        for did, d in list(self.doctors.items()):
+            if d.session_id == session_id:
                 try:
-                    await doctor_info.ws.send(json.dumps(message))
-                    doctors_notified += 1
-                    logger.info(f"📤 Predicción enviada al doctor {doctor_id}")
+                    await d.ws.send(json.dumps(payload))
+                    sent += 1
                 except Exception as e:
-                    logger.error(f"❌ Error enviando predicción al doctor {doctor_id}: {e}")
-        
-        if doctors_notified == 0:
-            logger.warning(f"⚠️ No se encontraron doctores para la sesión {session_id}")
-    
-    async def send_prediction_error_to_doctors(self, session_id, error_message):
-        """Envía error de predicción a doctores"""
-        message = {
-            'type': 'prediction_error',
-            'sessionId': session_id,
-            'error': error_message,
-            'timestamp': int(time.time() * 1000)
-        }
-        
-        for doctor_id, doctor_info in self.doctors.items():
-            if doctor_info.session_id == session_id:
-                try:
-                    await doctor_info.ws.send(json.dumps(message))
-                except Exception as e:
-                    logger.error(f"❌ Error enviando error al doctor {doctor_id}: {e}")
-    
-    async def check_api_health(self):
-        """Verifica el estado de la API Flask"""
-        try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: requests.get(f"{PREDICTION_API_URL}/health", timeout=5)
-            )
-            
-            if response.status_code == 200:
-                logger.info("✅ API Flask conectada")
-                return True
-            else:
-                logger.warning(f"⚠️ API Flask responde con código {response.status_code}")
-                return False
-                
-        except Exception as e:
-            logger.warning(f"❌ API Flask desconectada: {e}")
-            return False
-    
-    async def periodic_api_check(self):
-        """Verificación periódica del estado de la API"""
-        while True:
-            try:
-                old_status = self.api_connected
-                self.api_connected = await self.check_api_health()
-                
-                # Si cambió el estado, notificar a todos los doctores
-                if old_status != self.api_connected:
-                    await self.notify_api_status_to_doctors()
-                
-                await asyncio.sleep(CHECK_API_INTERVAL)
-            except Exception as e:
-                logger.error(f"❌ Error en verificación periódica de API: {e}")
-                await asyncio.sleep(CHECK_API_INTERVAL)
-    
-    async def notify_api_status_to_doctors(self):
-        """Notifica el estado de la API a todos los doctores"""
-        message = {
-            'type': 'api_status',
-            'connected': self.api_connected,
-            'timestamp': int(time.time() * 1000)
-        }
-        
-        for doctor_id, doctor_info in self.doctors.items():
-            try:
-                await doctor_info.ws.send(json.dumps(message))
-            except Exception as e:
-                logger.error(f"❌ Error enviando estado API al doctor {doctor_id}: {e}")
-    
-    async def cleanup_client(self, websocket):
-        """Limpia un cliente desconectado"""
-        # Buscar y remover de doctors
-        for doctor_id, doctor_info in list(self.doctors.items()):
-            if doctor_info.ws == websocket:
-                logger.info(f"🧹 Limpiando doctor: {doctor_id}")
-                del self.doctors[doctor_id]
+                    logger.warning(f"Falló envío a doctor {did}: {e}")
+        if sent == 0:
+            logger.warning(f"Sin doctores en sesión {session_id}")
+
+    async def _cleanup_client(self, websocket):
+        removed_id = None
+        removed_type = None
+        for did, d in list(self.doctors.items()):
+            if d.ws == websocket:
+                del self.doctors[did]
+                removed_id, removed_type = did, "doctor"
                 break
-        
-        # Buscar y remover de patients
-        for patient_id, patient_info in list(self.patients.items()):
-            if patient_info.ws == websocket:
-                logger.info(f"🧹 Limpiando paciente: {patient_id}")
-                del self.patients[patient_id]
-                break
-    
-    async def send_error(self, websocket, error_message):
-        """Envía un mensaje de error al cliente"""
+        if not removed_id:
+            for pid, p in list(self.patients.items()):
+                if p.ws == websocket:
+                    del self.patients[pid]
+                    removed_id, removed_type = pid, "patient"
+                    break
+        if removed_id:
+            for sid, parts in list(self.sessions.items()):
+                if parts.get(removed_type) == removed_id:
+                    parts[removed_type] = None
+                    if not parts.get("doctor") and not parts.get("patient"):
+                        del self.sessions[sid]
+                    break
+
+    async def _send_error(self, websocket, msg: str):
         try:
             await websocket.send(json.dumps({
-                'type': 'error',
-                'message': error_message,
-                'timestamp': int(time.time() * 1000)
+                "type": "error",
+                "message": msg,
+                "timestamp": int(time.time()*1000)
             }))
-        except Exception as e:
-            logger.error(f"❌ Error enviando mensaje de error: {e}")
+        except Exception:
+            pass
 
+# ===================== main =====================
 async def main():
-    """Función principal"""
     server = WebSocketServer()
-    await server.start_server()
+    await server.start()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Servidor detenido por el usuario")
-    except Exception as e:
-        logger.error(f"❌ Error fatal: {e}")
+        logger.info("🛑 Detenido por usuario")
