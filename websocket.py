@@ -7,6 +7,11 @@ WS prototipo 'todo en el servidor':
 - Predice palabra por palabra
 - Notifica a doctores 'phrase_result' y 'word_result'
 """
+# ===================== Imports extra (arriba del archivo) =====================
+from helpers import mediapipe_detection, extract_keypoints, get_word_ids
+from evaluate_model import normalize_keypoints
+from constants import MODEL_FRAMES
+
 
 import asyncio
 import json
@@ -32,9 +37,9 @@ import mediapipe as mp
 WS_HOST = "0.0.0.0"
 WS_PORT = 8080
 
-MODEL_PATH = "./model.h5"           # <<--- AJUSTA
-WORDS_JSON_PATH = "./words.json"    # <<--- AJUSTA si usas un mapeo id->texto
-MODEL_FRAMES = 15                   # nº de frames por secuencia que espera el modelo
+MODEL_PATH = "./models/actions_30.h5"           # <<--- AJUSTA
+WORDS_JSON_PATH = "./models/words.json"    # <<--- AJUSTA si usas un mapeo id->texto
+MODEL_FRAMES = 30                 # nº de frames por secuencia que espera el modelo
 THRESHOLD = 0.7                     # umbral prob. para aceptar palabra
 
 # WebSocket settings
@@ -109,20 +114,7 @@ def extract_keypoints(results: mp_holistic.Holistic) -> np.ndarray:
       face: 468*3 (x,y,z)
       manos: 21*3 por mano (izq/der)
     """
-    pose = []
-    if results.pose_landmarks:
-        for lm in results.pose_landmarks.landmark:
-            pose.extend([lm.x, lm.y, lm.z, lm.visibility])
-    else:
-        pose = [0.0] * (33 * 4)
-
-    face = []
-    if results.face_landmarks:
-        for lm in results.face_landmarks.landmark:
-            face.extend([lm.x, lm.y, lm.z])
-    else:
-        face = [0.0] * (468 * 3)
-
+    # Solo manos: 21*3*2 = 126
     lh = []
     if results.left_hand_landmarks:
         for lm in results.left_hand_landmarks.landmark:
@@ -137,7 +129,7 @@ def extract_keypoints(results: mp_holistic.Holistic) -> np.ndarray:
     else:
         rh = [0.0] * (21 * 3)
 
-    return np.array(pose + face + lh + rh, dtype=np.float32)
+    return np.array(lh + rh, dtype=np.float32)
 
 def frames_to_keypoints_sequence(frames_bgr: List[np.ndarray], holistic: mp_holistic.Holistic) -> np.ndarray:
     """
@@ -169,8 +161,8 @@ class WebSocketServer:
         logger.info("Cargando modelo Keras...")
         self.model = load_model(MODEL_PATH)
         logger.info("Modelo cargado.")
-        self.class_labels = load_words_map(WORDS_JSON_PATH)
-        logger.info(f"Clases cargadas: {len(self.class_labels)}")
+        self.class_labels = get_word_ids(WORDS_JSON_PATH)
+        logger.info(f"Clases cargadas: {len(self.class_labels)} etiquetas -> {self.class_labels}")  
 
         # MediaPipe Holistic: crear uno por servidor (uso en to_thread)
         self.holistic = mp_holistic.Holistic(static_image_mode=False, model_complexity=1)
@@ -181,7 +173,7 @@ class WebSocketServer:
             self._handle_client,
             WS_HOST,
             WS_PORT,
-            max_size=WS_MAX_MSG_SIZE,
+            max_size=None,
             ping_interval=WS_PING_INTERVAL,
             ping_timeout=WS_PING_TIMEOUT,
         ):
@@ -253,10 +245,12 @@ class WebSocketServer:
           phraseText?: ""
         }
         """
+
         session_id = data.get("sessionId")
         patient_id = data.get("patientId")
         phrase_id  = data.get("phraseId")
         words      = data.get("words", [])
+        logger.info(f"Recibidas {len(words)} palabras en phrase_frames para session_id={session_id}")
         if not session_id or not isinstance(words, list) or len(words) == 0:
             await self._send_error(websocket, "phrase_frames: payload inválido")
             return
@@ -268,7 +262,7 @@ class WebSocketServer:
 
         # Procesar en hilo para no bloquear el loop
         word_preds = await asyncio.to_thread(self._predict_phrase, words, MAX_FRAMES_PER_WORD)
-
+        print("Predicciones frase:", word_preds)
         # Construir resultados
         word_results = []
         final_texts = []
@@ -282,7 +276,7 @@ class WebSocketServer:
                 final_texts.append(pred_label)
 
         phrase_text = " ".join(final_texts).strip()
-
+        print("Frase reconstruida:", phrase_text)
         # Notificar doctores de la sesión
         msg = {
             "type": "phrase_result",
@@ -300,9 +294,9 @@ class WebSocketServer:
         """
         Sin async: corre en hilo via asyncio.to_thread
         - Decodifica frames
-        - Extrae keypoints
-        - Normaliza a MODEL_FRAMES
-        - Predice
+        - Extrae keypoints con helpers
+        - Normaliza con normalize_keypoints
+        - Predice usando el modelo Keras
         Devuelve lista de tuplas (label, prob) por palabra en el mismo orden.
         """
         results = []
@@ -311,7 +305,7 @@ class WebSocketServer:
                 results.append((None, 0.0))
                 continue
 
-            # 1) Decode data URLs -> BGR
+            # 1️⃣ Decode frames a BGR
             frames_bgr = []
             for i, fr in enumerate(word_frames[:max_frames_per_word]):
                 data_url = fr.get("data")
@@ -325,22 +319,28 @@ class WebSocketServer:
                 results.append((None, 0.0))
                 continue
 
-            # 2) Keypoints para cada frame
-            seq = frames_to_keypoints_sequence(frames_bgr, self.holistic)  # [T, D]
+            # 2️⃣ Extraer keypoints con el helper (mismo flujo del PyQt)
+            seq = []
+            for frame in frames_bgr:
+                results_mp = mediapipe_detection(frame, self.holistic)
+                kps = extract_keypoints(results_mp)
+                seq.append(kps)
 
-            # 3) Normalizar a MODEL_FRAMES
-            seq_fixed = zero_pad_or_trim(seq, MODEL_FRAMES)                # [MODEL_FRAMES, D]
+            # 3️⃣ Normalizar igual que en evaluate_model.py
+            seq_fixed = normalize_keypoints(seq, int(MODEL_FRAMES))
 
-            # 4) Predicción
-            inp = np.expand_dims(seq_fixed, axis=0)                        # [1, T, D]
-            probs = self.model.predict(inp, verbose=0)[0]                  # [num_classes]
+            # 4️⃣ Predicción con el modelo cargado
+            inp = np.expand_dims(seq_fixed, axis=0)
+            probs = self.model.predict(inp, verbose=0)[0]
             cls_idx = int(np.argmax(probs))
             prob = float(probs[cls_idx])
 
-            # 5) Label legible
+            # 5️⃣ Etiqueta legible
             label = self.class_labels[cls_idx] if cls_idx < len(self.class_labels) else f"class_{cls_idx}"
             results.append((label, prob))
+
         return results
+
 
     # ---------- Word (compat) ----------
     async def _handle_word_frames(self, websocket, data):
