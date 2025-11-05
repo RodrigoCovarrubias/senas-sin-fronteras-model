@@ -12,7 +12,8 @@ from helpers import mediapipe_detection, extract_keypoints, get_word_ids
 from evaluate_model import normalize_keypoints
 from constants import MODEL_FRAMES
 
-
+from openai import OpenAI
+import requests
 import asyncio
 import json
 import logging
@@ -27,6 +28,7 @@ import numpy as np
 import cv2
 import websockets
 from websockets.exceptions import ConnectionClosed
+
 
 # ====== ML / Keypoints ======
 import tensorflow as tf
@@ -49,6 +51,16 @@ WS_PING_TIMEOUT  = 20
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger("ssf-ws")
+
+
+# ===================== AGENTE =====================
+
+OPENROUTER_API_KEY = ""  # No la dejes pública en el repo
+client = OpenAI(
+    api_key=OPENROUTER_API_KEY
+)
+
+# ===================== AGENTE =====================
 
 # ===================== Utilidades =====================
 data_url_re = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<b64>.+)$")
@@ -232,63 +244,97 @@ class WebSocketServer:
             "id": cid,
             "sessionId": sid
         }))
+ 
+
+
+    def generate_medical_sentence(self, words):
+        if not words:
+            return ""
+
+        prompt = f"""
+        Contexto: el usuario está describiendo síntomas médicos en lenguaje de señas.
+
+        Tarea: une las siguientes palabras en una frase médica coherente, breve y natural en español. 
+        Debe sonar como una descripción de síntomas o malestar.
+        No añadas ninguna explicación, comentario ni comillas; responde únicamente con la frase final.
+
+        Palabras: {words}
+        """
+
+        # Inicializa el cliente de OpenAI
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",  # puedes cambiar a gpt-4o o gpt-4o-mini
+                messages=[
+                    {"role": "system", "content": "Eres un asistente médico que genera frases naturales basadas en síntomas."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=50,
+                temperature=0.3  
+            )
+
+            return response.choices[0].message.content.strip()
+
+        except Exception as e:
+            print(f"❌ Error generando frase con OpenAI: {e}")
+            return "Error al generar la frase"
+
 
     # ---------- Phrase (lista de lista) ----------
     async def _handle_phrase_frames(self, websocket, data):
-        """
-        data: {
-          type: "phrase_frames",
-          sessionId, patientId, phraseId,
-          words: [ [ {ts,mime,data}, ... ], [ ... ], ... ],
-          meta: {width,height,fps}?,
-          wordTexts?: [],
-          phraseText?: ""
-        }
-        """
+            session_id = data.get("sessionId")
+            patient_id = data.get("patientId")
+            phrase_id  = data.get("phraseId")
+            words      = data.get("words", [])
+            logger.info(f"Recibidas {len(words)} palabras en phrase_frames para session_id={session_id}")
+            if not session_id or not isinstance(words, list) or len(words) == 0:
+                await self._send_error(websocket, "phrase_frames: payload inválido")
+                return
 
-        session_id = data.get("sessionId")
-        patient_id = data.get("patientId")
-        phrase_id  = data.get("phraseId")
-        words      = data.get("words", [])
-        logger.info(f"Recibidas {len(words)} palabras en phrase_frames para session_id={session_id}")
-        if not session_id or not isinstance(words, list) or len(words) == 0:
-            await self._send_error(websocket, "phrase_frames: payload inválido")
-            return
+            MAX_WORDS = 20
+            MAX_FRAMES_PER_WORD = 120
+            words = words[:MAX_WORDS]
 
-        # límites defensivos
-        MAX_WORDS = 20
-        MAX_FRAMES_PER_WORD = 120
-        words = words[:MAX_WORDS]
+            # --- Predicción por palabra ---
+            word_preds = await asyncio.to_thread(self._predict_phrase, words, MAX_FRAMES_PER_WORD)
+            logger.info(f"Predicciones frase: {word_preds}")
 
-        # Procesar en hilo para no bloquear el loop
-        word_preds = await asyncio.to_thread(self._predict_phrase, words, MAX_FRAMES_PER_WORD)
-        print("Predicciones frase:", word_preds)
-        # Construir resultados
-        word_results = []
-        final_texts = []
-        for pred_label, prob in word_preds:
-            if pred_label is None:
-                word_results.append({"label": None, "prob": 0.0})
-                continue
-            word_results.append({"label": pred_label, "prob": float(prob)})
-            # aplicar threshold aquí si quieres filtrar palabras con baja confianza
-            if prob >= THRESHOLD:
-                final_texts.append(pred_label)
+            word_results = []
+            final_texts = []
+            for pred_label, prob in word_preds:
+                if pred_label is None:
+                    word_results.append({"label": None, "prob": 0.0})
+                    continue
+                word_results.append({"label": pred_label, "prob": float(prob)})
+                if prob >= THRESHOLD:
+                    final_texts.append(pred_label)
 
-        phrase_text = " ".join(final_texts).strip()
-        print("Frase reconstruida:", phrase_text)
-        # Notificar doctores de la sesión
-        msg = {
-            "type": "phrase_result",
-            "sessionId": session_id,
-            "patientId": patient_id,
-            "phraseId": phrase_id,
-            "words": word_results,             # [{label, prob}, ...] en el mismo orden que 'words'
-            "phraseText": phrase_text,         # texto reconstruido por umbral
-            "timestamp": int(time.time()*1000),
-            "threshold": THRESHOLD
-        }
-        await self._broadcast_to_doctors(session_id, msg)
+            # --- Generar frase final ---
+            if len(final_texts) == 1:
+                # ✅ Caso: una sola palabra → no usamos el agente
+                phrase_text = final_texts[0].capitalize()
+                logger.info(f"🗣️ Frase directa (una palabra): {phrase_text}")
+            elif len(final_texts) > 1:
+                # ✅ Caso: varias palabras → usamos LLM
+                phrase_text = self.generate_medical_sentence(final_texts)
+                logger.info(f"🩺 Frase generada por LLM: {phrase_text}")
+            else:
+                phrase_text = "(sin detección válida)"
+                logger.info("⚠️ No se detectaron palabras válidas")
+
+            # --- Notificar doctores ---
+            msg = {
+                "type": "phrase_result",
+                "sessionId": session_id,
+                "patientId": patient_id,
+                "phraseId": phrase_id,
+                "words": word_results,
+                "phraseText": phrase_text,
+                "timestamp": int(time.time()*1000),
+                "threshold": THRESHOLD
+            }
+            await self._broadcast_to_doctors(session_id, msg)
 
     def _predict_phrase(self, words_payload: List[List[dict]], max_frames_per_word: int):
         """
