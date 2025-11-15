@@ -31,7 +31,6 @@ tmp/
 .cache/
 
 # Model/data folders
-models/
 data/
 frame_Actions/
 
@@ -51,7 +50,6 @@ __pycache__/constants.cpython-310.pyc
 
 # add frame_Actions folder
 frame_Actions/
-models/
 data/
 
 .venv_rt310

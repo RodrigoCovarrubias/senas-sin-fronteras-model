@@ -8,6 +8,9 @@ WS prototipo 'todo en el servidor':
 - Notifica a doctores 'phrase_result' y 'word_result'
 """
 # ===================== Imports extra (arriba del archivo) =====================
+
+from dotenv import load_dotenv
+import os
 from helpers import mediapipe_detection, extract_keypoints, get_word_ids
 from evaluate_model import normalize_keypoints
 from constants import MODEL_FRAMES
@@ -55,7 +58,7 @@ logger = logging.getLogger("ssf-ws")
 
 # ===================== AGENTE =====================
 
-OPENROUTER_API_KEY = ""  # No la dejes pública en el repo
+OPENROUTER_API_KEY = ""  
 client = OpenAI(
     api_key=OPENROUTER_API_KEY
 )
@@ -448,6 +451,7 @@ class WebSocketServer:
                 if parts.get(removed_type) == removed_id:
                     parts[removed_type] = None
                     if not parts.get("doctor") and not parts.get("patient"):
+                        logger.info(f"🗑️ Sesión {sid} cerrada (sin clientes conectados)")
                         del self.sessions[sid]
                     break
 
