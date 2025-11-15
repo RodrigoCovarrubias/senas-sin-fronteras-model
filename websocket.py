@@ -39,7 +39,7 @@ from tensorflow.keras.models import load_model
 import mediapipe as mp
 
 # ===================== Config =====================
-WS_HOST = "127.0.0.1"
+WS_HOST = "0.0.0.0"
 WS_PORT = 8081
 
 MODEL_PATH = "./models/actions_30.h5"           # <<--- AJUSTA
