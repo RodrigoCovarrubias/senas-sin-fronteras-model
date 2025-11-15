@@ -40,7 +40,7 @@ import mediapipe as mp
 
 # ===================== Config =====================
 WS_HOST = "127.0.0.1"
-WS_PORT = 8080
+WS_PORT = 8081
 
 MODEL_PATH = "./models/actions_30.h5"           # <<--- AJUSTA
 WORDS_JSON_PATH = "./models/words.json"    # <<--- AJUSTA si usas un mapeo id->texto
