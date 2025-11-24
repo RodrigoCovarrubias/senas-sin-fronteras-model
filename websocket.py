@@ -258,12 +258,9 @@ class WebSocketServer:
             return ""
 
         prompt = f"""
-        Contexto: el usuario está describiendo síntomas médicos en lenguaje de señas.
-
-        Tarea: une las siguientes palabras en una frase médica coherente, breve y natural en español. 
-        Debe sonar como una descripción de síntomas o malestar.
-        No añadas ninguna explicación, comentario ni comillas; responde únicamente con la frase final.
-
+        Contexto: el usuario está describiendo síntomas médicos mediante lengua de señas.
+        Tarea: forma una frase breve, coherente y natural en español que combine las siguientes palabras, como si fuera una descripción auténtica de un malestar o síntoma.
+        No incluyas explicaciones, comentarios ni signos de puntuación innecesarios; responde únicamente con la frase resultante.
         Palabras: {words}
         """
 
