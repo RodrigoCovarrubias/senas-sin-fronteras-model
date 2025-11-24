@@ -31,6 +31,7 @@ import numpy as np
 import cv2
 import websockets
 from websockets.exceptions import ConnectionClosed
+import base64
 
 
 # ====== ML / Keypoints ======
@@ -58,10 +59,12 @@ logger = logging.getLogger("ssf-ws")
 
 # ===================== AGENTE =====================
 
-OPENROUTER_API_KEY = ""  
+OPENROUTER_API_KEY = "c2stcHJvai1jamtiUXZEME9jWHlENGswUndzT3VyYnFhbWh6ZTQzV204blB1UVFRQWZXWTFRLVgyUWhnU2dvZEJEYldiNmFJNzhISGUtOWt1OVQzQmxia0ZKejhNYS05eDNSQ3hmNEFnRS14OHdYMng5U2RmR2FhZ1J2YUR0ZFhHd00yYXFHcUtUdDQtM0VMaVNEUjBYYnNsbHlRNTE0WVM2OEE="  
 client = OpenAI(
     api_key=OPENROUTER_API_KEY
 )
+
+OPENROUTER_API_KEY = base64.b64decode(OPENROUTER_API_KEY).decode("utf-8")
 
 # ===================== AGENTE =====================
 
